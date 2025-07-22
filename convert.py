@@ -140,8 +140,8 @@ def postprocess(out, img_h, img_w):
     gridIndex = -2
 
     for index in range(headNum):
-        cls = output[index * 2 + 0]
-        reg = output[index * 2 + 1]
+        reg = output[index * 2 + 0]
+        cls = output[index * 2 + 1]
         msk = output[6 + index]
 
         for h in range(mapSize[index][0]):
