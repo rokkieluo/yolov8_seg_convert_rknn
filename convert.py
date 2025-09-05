@@ -8,11 +8,13 @@ import cv2
 from rknn.api import RKNN
 from math import exp
 
-ONNX_MODEL = './yolov8n-seg-relu.onnx'
-RKNN_MODEL = './yolov8n-seg-relu.rknn'
+ONNX_MODEL = './yolov8n-seg.onnx'
+RKNN_MODEL = './yolov8n-seg-int.rknn'
 DATASET = './dataset.txt'
 
 QUANTIZE_ON = True
+
+
 
 CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
          'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
@@ -24,8 +26,21 @@ CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
          'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
          'hair drier', 'toothbrush']
 
+meshgrid = []
 
-color_dict = {
+class_num = len(CLASSES)
+head_num = 3
+strides = [8, 16, 32]
+map_size = [[80, 80], [40, 40], [20, 20]]
+nms_thresh = 0.45
+object_thresh = 0.65
+
+input_imgH = 640
+input_imgW = 640
+
+maskNum = 32
+
+color_list = {
     0: (000, 000, 255),
     1: (255, 128, 000),
     2: (255, 255, 000),
@@ -37,21 +52,6 @@ color_dict = {
     8: (128, 000, 000),
     9: (000, 128, 000),
 }
-
-meshgrid = []
-
-class_num = len(CLASSES)
-headNum = 3
-strides = [8, 16, 32]
-mapSize = [[80, 80], [40, 40], [20, 20]]
-nmsThresh = 0.45
-objectThresh = 0.5
-
-input_imgH = 640
-input_imgW = 640
-
-maskNum = 32
-
 
 
 class DetectBox:
@@ -66,9 +66,9 @@ class DetectBox:
 
 
 def GenerateMeshgrid():
-    for index in range(headNum):
-        for i in range(mapSize[index][0]):
-            for j in range(mapSize[index][1]):
+    for index in range(head_num):
+        for i in range(map_size[index][0]):
+            for j in range(map_size[index][1]):
                 meshgrid.append(j + 0.5)
                 meshgrid.append(i + 0.5)
 
@@ -116,10 +116,9 @@ def NMS(detectResult):
                     xmax2 = sort_detectboxs[j].xmax
                     ymax2 = sort_detectboxs[j].ymax
                     iou = IOU(xmin1, ymin1, xmax1, ymax1, xmin2, ymin2, xmax2, ymax2)
-                    if iou > nmsThresh:
+                    if iou > nms_thresh:
                         sort_detectboxs[j].classId = -1
     return predBoxs
-
 
 
 def sigmoid(x):
@@ -138,41 +137,69 @@ def postprocess(out, img_h, img_w):
     scale_w = img_w / input_imgW
 
     gridIndex = -2
+    cls_index = 0
+    cls_max = 0
 
-    for index in range(headNum):
-        reg = output[index * 2 + 0]
+    for index in range(head_num):
         cls = output[index * 2 + 1]
+        reg = output[index * 2 + 0]
         msk = output[6 + index]
 
-        for h in range(mapSize[index][0]):
-            for w in range(mapSize[index][1]):
+        for h in range(map_size[index][0]):
+            for w in range(map_size[index][1]):
                 gridIndex += 2
 
-                for cl in range(class_num):
-                    cls_val = sigmoid(cls[cl * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w])
+                if 1 == class_num:
+                    cls_max = sigmoid(cls[0 * map_size[index][0] * map_size[index][1] + h * map_size[index][1] + w])
+                    cls_index = 0
+                else:
+                    for cl in range(class_num):
+                        cls_val = cls[cl * map_size[index][0] * map_size[index][1] + h * map_size[index][1] + w]
+                        if 0 == cl:
+                            cls_max = cls_val
+                            cls_index = cl
+                        else:
+                            if cls_val > cls_max:
+                                cls_max = cls_val
+                                cls_index = cl
+                    cls_max = sigmoid(cls_max)
 
-                    if cls_val > objectThresh:
-                        x1 = (meshgrid[gridIndex + 0] - reg[0 * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w]) * strides[index]
-                        y1 = (meshgrid[gridIndex + 1] - reg[1 * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w]) * strides[index]
-                        x2 = (meshgrid[gridIndex + 0] + reg[2 * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w]) * strides[index]
-                        y2 = (meshgrid[gridIndex + 1] + reg[3 * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w]) * strides[index]
+                if cls_max > object_thresh:
+                    regdfl = []
+                    for lc in range(4):
+                        sfsum = 0
+                        locval = 0
+                        for df in range(16):
+                            temp = exp(reg[((lc * 16) + df) * map_size[index][0] * map_size[index][1] + h * map_size[index][1] + w])
+                            reg[((lc * 16) + df) * map_size[index][0] * map_size[index][1] + h * map_size[index][1] + w] = temp
+                            sfsum += temp
 
-                        xmin = x1 * scale_w
-                        ymin = y1 * scale_h
-                        xmax = x2 * scale_w
-                        ymax = y2 * scale_h
+                        for df in range(16):
+                            sfval = reg[((lc * 16) + df) * map_size[index][0] * map_size[index][1] + h * map_size[index][1] + w] / sfsum
+                            locval += sfval * df
+                        regdfl.append(locval)
 
-                        xmin = xmin if xmin > 0 else 0
-                        ymin = ymin if ymin > 0 else 0
-                        xmax = xmax if xmax < img_w else img_w
-                        ymax = ymax if ymax < img_h else img_h
+                    x1 = (meshgrid[gridIndex + 0] - regdfl[0]) * strides[index]
+                    y1 = (meshgrid[gridIndex + 1] - regdfl[1]) * strides[index]
+                    x2 = (meshgrid[gridIndex + 0] + regdfl[2]) * strides[index]
+                    y2 = (meshgrid[gridIndex + 1] + regdfl[3]) * strides[index]
 
-                        mask = []
-                        for m in range(maskNum):
-                            mask.append(msk[m * mapSize[index][0] * mapSize[index][1] + h * mapSize[index][1] + w])
+                    xmin = x1 * scale_w
+                    ymin = y1 * scale_h
+                    xmax = x2 * scale_w
+                    ymax = y2 * scale_h
 
-                        box = DetectBox(cl, cls_val, xmin, ymin, xmax, ymax, mask)
-                        detectResult.append(box)
+                    xmin = xmin if xmin > 0 else 0
+                    ymin = ymin if ymin > 0 else 0
+                    xmax = xmax if xmax < img_w else img_w
+                    ymax = ymax if ymax < img_h else img_h
+
+                    mask = []
+                    for m in range(maskNum):
+                        mask.append(msk[m * map_size[index][0] * map_size[index][1] + h * map_size[index][1] + w])
+
+                    box = DetectBox(cls_index, cls_max, xmin, ymin, xmax, ymax, mask)
+                    detectResult.append(box)
     # NMS
     print('detectResult:', len(detectResult))
     predBox = NMS(detectResult)
@@ -182,7 +209,7 @@ def postprocess(out, img_h, img_w):
 
 def seg_postprocess(out, predbox, img_h, img_w):
     print('seg_postprocess ... ')
-    protos = np.array(out[-1][0])
+    protos = np.array(out[9][0])
 
     c, mh, mw = protos.shape
     seg_mask = np.zeros(shape=(mh, mw, 3))
@@ -202,11 +229,12 @@ def seg_postprocess(out, predbox, img_h, img_w):
         for h in range(ymin, ymax):
             for w in range(xmin, xmax):
                 if masks[h, w] > 0.5:
-                    seg_mask[h, w, :] = color_dict[classId % 9]
+                    seg_mask[h, w, :] = color_list[classId]
 
     seg_mask = cv2.resize(seg_mask, (img_w, img_h))
     seg_mask = seg_mask.astype("uint8")
     return seg_mask
+
 
 
 def export_rknn_inference(img):
@@ -220,7 +248,7 @@ def export_rknn_inference(img):
 
     # Load ONNX model
     print('--> Loading model')
-    ret = rknn.load_onnx(model=ONNX_MODEL, outputs=["cls1", "reg1", "cls2", "reg2", "cls3", "reg3", "mc1", "mc2", "mc3", "seg"])
+    ret = rknn.load_onnx(model=ONNX_MODEL)
     if ret != 0:
         print('Load model failed!')
         exit(ret)
@@ -277,6 +305,7 @@ if __name__ == '__main__':
 
     out = []
     for i in range(len(outputs)):
+        print(outputs[i].shape)   
         out.append(outputs[i])
     predbox = postprocess(out, img_h, img_w)
 
